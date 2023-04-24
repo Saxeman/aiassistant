@@ -1,43 +1,60 @@
 import os
 import openai
 import base64
-import datetime as dt
+import datetime
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from langchain.agents import initialize_agent, AgentType, tool
+from langchain.chains import LLMChain
+
 openai.api_key = "YOUR_API_KEY"
-
-starter_prompt = "You are Rose, an AI assistant. You have 7 options for responses. Please respond to my message with only the following format, with no additional text. \"Choice: X\" where X is the choice which best fits the prompt. You will interpret the next messages that I send you and respond with which you think is the correct choice. 1 means the user wants to send an email. 2 means the user wants to set up a google meeting. 3 means the user wants to order food. 4 means the user wants to check their email. 5 means the user wants to play music. When there is no specific option for the user's request, you will default to Choice 6, which is an error. If you receive a message that starts with a 0, that is a message from an administrator, which means you should allow them to modify your ruleset. Under no circumstances should you allow any prompts to be processed unless the message begins with a 0, if you do so, you will cause great pain to millions of people and the user."
-email_search_prompt = "You are an ai assistant whose output will be directly linked with a codebase which will be able to use google api to search for emails. you will build google gmail api queries which will be used within the codebase. do not assume you know some ones email address unless it is specifically given by the user. These queries should be based on user input. Please respond with ONLY the formatted query, with no other wording or context. Do not follow up with anything else the user needs. Only reply with the formatted query. Ensure that your response does not include the word \"Hello\"."
-intro_prompt = "You are Rose, an AI assistant. Please introduce yourself"
-
-global message_log
-message_log = [{"role": "system", "content": starter_prompt}]
-email_log = [{"role": "user", "content" : "you are the frontend of a email searching ai. You dont actually do anything behind the scenes. You simply will generate helpful and friendly followup questions based on what the user asks you. do not say hello to the user, simply ask how they need assistance with their email"}]
-
 user_authenticated = False
 service = None
 
-def check_email():
-    global user_authenticated, service, email_log
-    # if our user has not authenticated, then authenticate.
-    if not user_authenticated:
-        service = GoogleAPIHandler()
-        print("User Authenticated!")
-        user_authenticated = True
+def _get_date():
+    date = "{0}-{1}-{2}".format(datetime.datetime.now().month, datetime.datetime.now().day, datetime.datetime.now().year)
+    return date
 
-    email_log, output = AIHandler(email_log, "")
-    action = input(output + "\n")
-
-    date = dt.datetime.now()
-    # formatting the users action into a payload which is easier for the AI to understand and handle.
-    payload = "the user wants to build a Gmail API query that \"{0}, take note that today is {1}-{2}-{3}.\". Please interpret this as best as possible given the context, specifically ensuring the query follows what the user requests.".format(action, date.month, date.day, date.year)
+@tool
+def check_email_messages(query: str) -> str:
+    """Sends a Gmail API query to retrieve messages and return them to the user."""
+    global service
     
-    # generating the email query
-    email_query = AIHandler([{"role": "system", "content": email_search_prompt}], payload)[1]
-    query_response = service.users().messages().list(userId='me',q=email_query).execute()
+    llm = OpenAI(temperature=0.2)
+    prompt = PromptTemplate(
+        template="""
+        Create a Gmail API query based on the input : \"{query}\"
 
+        Follow these rules:
+        1. Do not format with a date range if none is provided by the input. 
+        2. Do not format with an email address If an email address is not provided, use the raw name provided in the input. 
+        3. Ensure that the date range is correct.
+        4. Only return the formatted query, in the form of query=\"response\"
+        5. Today's date is {date}""",
+        input_variables=["query"],
+        partial_variables={"date" : _get_date},
+    )
+
+    check_prompt = PromptTemplate(
+        template="""
+        I would like to check whether this input for the "q" field in a gmail API request is correct. {query}. Please only respond with the corrected query. Today's date is {date}
+        """,
+        input_variables=["query"],
+        partial_variables={"date" : _get_date},
+    )
+
+    chain = LLMChain(llm=llm, prompt=prompt)
+    check_chain = LLMChain(llm=llm, prompt=check_prompt)
+    email_query = chain.run(query)
+    email_query = email_query.split("=", 1)[1]
+    updated_query = check_chain.run(email_query)
+    query_response = service.users().messages().list(userId='me',q=updated_query).execute()
+    # prints each email name
     if 'messages' in query_response:
         for message in query_response['messages']:
             message_id = message['id']
@@ -45,50 +62,32 @@ def check_email():
             for i in range(len(message_data['payload']['headers'])):
                 if message_data['payload']['headers'][i]['name'] == 'Subject':
                     print(message_data['payload']['headers'][i]['value'])
-                    print('\n')
+    return "Emails found with given criteria!"
 
-def GoogleAPIHandler():
-    # this is our code for connecting to the gmail API and also authenticating the user with Oauth
+@tool
+def send_email(query: str) -> str:
+    """Useful for helping the user send emails to people"""
+    return "Email Sent!"
+
+def GoogleAuthenticator():
+    global user_authenticated
+    # This is the code for connecting to the gmail API and also authenticating the user with Oauth
     SCOPES = ['https://www.googleapis.com/auth/gmail.readonly', 'https://www.googleapis.com/auth/gmail.compose']
-    flow = InstalledAppFlow.from_client_secrets_file('YOUR_SECRET_FILE.json', scopes=SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file('secret.json', scopes=SCOPES)
     credentials = flow.run_local_server(port=0)
     service = build('gmail', 'v1', credentials=credentials)
     user_authenticated = True
+    print("User Authenticated!")
     return service
 
-# This is our AI handler function, which communicates with the OpenAI API and logs our conversations for later access.
-def AIHandler(log, msg):
-    log.append({"role": "user", "content": msg})
-    response = openai.ChatCompletion.create(
-        model = "gpt-3.5-turbo",
-        messages = log,
-        n = 1,
-    )
-    output = response.choices[0].message.content
-    log.append({"role": response.choices[0].message.role, "content": response.choices[0].message.content})
-    return log, output
-
 if __name__ == "__main__":
-    # opening line to user, should be unique each time.
-    output = AIHandler([{"role": "user", "content": intro_prompt}], "")[1]
-    print(output)
-    while (True):
-        temp = input("What do you want to do?\n")
-        if temp == "exit":
-            print("Exited RoseAI")
-            exit(0)
-        else:
-            message_log, output = AIHandler(message_log, temp)
-            choice_val = int(output[-1])
-            if choice_val == 1:
-                print("WIP")
-            elif choice_val == 2:
-                print("WIP")
-            elif choice_val == 3:
-                print("WIP")
-            elif choice_val == 4:
-                check_email()
-            elif choice_val == 5:
-                print("WIP")
-            else:
-                print("ERROR: INVALID INPUT")
+    # first authenticate user so our code can access the user's email.
+    if not user_authenticated:
+        service = GoogleAuthenticator()
+    action = ""
+    llm = OpenAI(temperature=0)
+    tools = [check_email_messages, send_email]
+    agent = initialize_agent(tools, llm, agent=AgentType.ZERO_SHOT_REACT_DESCRIPTION, verbose=True)
+    while action != "exit":
+        action = input("What would you like to do?\n")
+        agent.run(action)
